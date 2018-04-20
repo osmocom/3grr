@@ -1,0 +1,712 @@
+# encoding: utf-8
+# ruby: 2.4.2
+=begin
+This program is free software: you can redistribute it and/or modify
+it under the terms of the GNU General Public License as published by
+the Free Software Foundation, either version 3 of the License, or
+(at your option) any later version.
+
+This program is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+GNU General Public License for more details.
+
+You should have received a copy of the GNU General Public License
+along with this program.  If not, see <http://www.gnu.org/licenses/>.
+
+Copyright (c) 2018 Kevin Redon <kevredon@tsaitgaist.info>
+=end
+=begin
+Rakefile to add revision control to 3GPP specifications.
+Actions performed:
+- download (missing) 3GPP specification .zip archives
+- extract 3GPP specification .doc documents
+- convert .doc documents to .xhtml documents
+- extract text from .xhtml documents into .txt files
+- pus 3GPP .txt specification versions in a git repository
+=end
+require 'rake'
+require 'rake/clean'
+require 'zip'
+require 'open3'
+require 'nokogiri'
+
+# display all target steps
+DEBUG = true
+
+desc "download tike document converter"
+task :tika => "tika-app.jar"
+
+desc "download tike document converter"
+file "tika-app.jar" do |t|
+  sh "wget --output-document=\"#{t.name}\" \"http://mirror.netcologne.de/apache.org/tika/tika-app-1.17.jar\""
+end
+
+desc "get latest 3GPP specifications"
+task :download do
+  sh "wget --mirror --timeout=10 ftp://ftp.3gpp.org/Specs/archive/"
+end
+SPEC_DIR = "ftp.3gpp.org/Specs/archive"
+file SPEC_DIR => :download
+
+desc "initialize git repository"
+task :git => ['.git', '.gitignore']
+
+desc "exclude temporary files from git"
+file '.gitignore' do |t|
+  File.open(t.name, "w") do |file|
+    file.puts "Rakefile"
+    file.puts "README"
+    file.puts "tika-app.jar"
+    file.puts ".listing" 
+    file.puts "# 3GPP archives"
+    file.puts "*.zip"
+    file.puts "*.ZIP"
+    file.puts "# intermediate files"
+    file.puts "*.doc"
+    file.puts "*.xhtml"
+    file.puts "*.txt"
+    file.puts "!**/*.*.txt"
+    file.puts "# unused 3GPP file"
+    file.puts "*readme*.txt"
+    file.puts "*README.txt"
+    file.puts "*.DOC"
+    file.puts "*.docx"
+    file.puts "*.OLD"
+    file.puts "*.MAR"
+    file.puts "*.pdf"
+    file.puts "*.xsd"
+    file.puts "# specification leftovers"
+    file.puts "ftp.3gpp.org/Specs/archive/23_series/23.140/schema/"
+    file.puts "ftp.3gpp.org/Specs/archive/26_series/26.234/schema/"
+    file.puts "ftp.3gpp.org/Specs/archive/26_series/26.444/test_sequences/" 
+  end
+end
+
+desc "initialize git repository"
+file '.git' => '.gitignore' do
+  sh 'git init'
+  sh 'git config user.name "3GPP revision control script"'
+  sh 'git config user.email ""'
+  sh 'git add --force .gitignore'
+  sh 'git commit -m "ignore source 3GPP files"' # serves also as first rebase parent
+end
+
+# known malformed specifications (drafts, wrong numbering/versioning) not to put in the versions list
+BAD_ARCHIVE = [
+  # wrong versioning
+  "ftp.3gpp.org/Specs/archive/30_series/30.802/30802-400error.zip",
+  "ftp.3gpp.org/Specs/archive/26_series/26.132/26132d001_rev.zip",
+  "ftp.3gpp.org/Specs/archive/26_series/26.115/26115d001.zip",
+  "ftp.3gpp.org/Specs/archive/26_series/26.975/26975d110.zip",
+  "ftp.3gpp.org/Specs/archive/50_series/50.099/50099-007duff.zip",
+  "ftp.3gpp.org/Specs/archive/03_series/03.20ext/0320ext-300'.zip",
+  "ftp.3gpp.org/Specs/archive/11_series/11.10-3/1110-3-4k1-.zip",
+  "ftp.3gpp.org/Specs/archive/11_series/11.10-3/1110-3-4k0-.zip",
+  "ftp.3gpp.org/Specs/archive/25_series/25.914/25914-a20_invalid.zip",
+  "ftp.3gpp.org/Specs/archive/25_series/25.331/25331vIntermediate.zip",
+  "ftp.3gpp.org/Specs/archive/25_series/25.331/25331d310.zip",
+  "ftp.3gpp.org/Specs/archive/22_series/22.935/22935-110_ex_S1-050610.zip",
+  "ftp.3gpp.org/Specs/archive/22_series/22.935/22935-110_ex_S1-050431.zip",
+  # wrong numbering
+  "ftp.3gpp.org/Specs/archive/03_series/03.71/03071-7b0.zip",
+  "ftp.3gpp.org/Specs/archive/03_series/03.71/03071-890.zip",
+  "ftp.3gpp.org/Specs/archive/22_series/22.960/22945-100.zip",
+  "ftp.3gpp.org/Specs/archive/25_series/25.212/25211-390.zip",
+  "ftp.3gpp.org/Specs/archive/25_series/25.212/25211-430.zip",
+  "ftp.3gpp.org/Specs/archive/25_series/25.832/25831-002.zip",
+  "ftp.3gpp.org/Specs/archive/26_series/26.973/26937-010.zip",
+  "ftp.3gpp.org/Specs/archive/33_series/33.833/33806-030.zip",
+  "ftp.3gpp.org/Specs/archive/25_series/25.925/25925_310.zip",
+  # unhandled multi-part specification
+  "ftp.3gpp.org/Specs/archive/05_series/05.10/0510-520a.zip",
+  "ftp.3gpp.org/Specs/archive/05_series/05.10/0510-520b.zip",
+]
+
+# 3GPP specification number (with some extensions)
+# the 3GPP specification numbering comment "The first two digits define the series, followed by 2 further digits for the 01 to 13 series or 3 further digits for the 21 to 55 series." does not apply
+SPECIFICATION_NUMBER_REGEXP = /(?<series>\d{2})\.(?<mantissa>\d{2,3})(?<other>dcs|ext|U)?(-(?<part>\d{1,2})(-(?<subpart>\d{1,2}))?)?/
+
+# 3GPP specification number with version
+SPECIFICATION_VERSION_REGEXP = /(?<series>\d{2})\.?(?<mantissa>\d{2,3})(?<other>dcs|ext|U|E)?(-(?<part>\d{1,2})(-(?<subpart>\d{1,2}))?)? ?[-_](?<version>[0-9a-z]{3,6}) ?/i
+
+# returns the (static) list of all specifications
+# specification format: {
+# - dir: path to directory containing all versions of a specification
+# - versions: list of .txt document versions of this specification (correspond the specification version archives)
+# - txt: TXT file for specification
+# }
+def specifications()
+  return @specs if @specs and !@specs.empty?
+  Rake::Task[SPEC_DIR].execute unless File.directory? SPEC_DIR
+  @specs = []
+  Dir.foreach(SPEC_DIR) do |series_file|
+    next if "."==series_file or ".."==series_file
+    series_path = "#{SPEC_DIR}/#{series_file}"
+    next unless File.directory? series_path
+    raise "unkown series format" unless series_file =~ /^\d{2}_series$/
+    Dir.foreach(series_path) do |specification_file|
+      next if "."==specification_file or ".."==specification_file
+      specification_path = "#{series_path}/#{specification_file}"
+      next unless File.directory? specification_path
+      number = specification_file.match(/^#{SPECIFICATION_NUMBER_REGEXP}$/)
+      unless number then
+        $stderr.puts "unkown number format: #{specification_file}"
+        next
+      end
+      versions = []
+      Dir.foreach(specification_path) do |archive_file|
+        next if "."==archive_file or ".."==archive_file
+        archive_path = "#{specification_path}/#{archive_file}"
+        next unless File.file? archive_path
+        next unless archive_file.end_with?(".zip") or archive_file.end_with?(".ZIP")
+        next if BAD_ARCHIVE.include? archive_path
+        version = archive_file.match(/^#{SPECIFICATION_VERSION_REGEXP}\.zip$/i)
+        unless version then
+          $stderr.puts "unknown version format: #{archive_file}"
+          next
+        end
+        unless number[:series].to_i==version[:series].to_i and number[:mantissa].to_i==version[:mantissa].to_i then
+          $stderr.puts "specification numbers do not match: #{archive_path}"
+          next
+        end
+        versions << archive_path.gsub(/zip$/i,"txt")
+      end
+      @specs << {dir: specification_path, txt: "#{specification_path}/#{specification_file}.txt", versions: versions}
+    end
+  end
+  return @specs
+end
+
+desc "generate latest text specifications"
+task :default => specifications.collect {|spec| spec[:txt]} do |t|
+#  puts t.prerequisites
+end
+
+# convert a month string into its 2 digit string number
+def month2num(month)
+  num = case month
+    when /jan/i
+      "01"
+    when /feb/i
+      "02"
+    when /mar/i
+      "03"
+    when /apr/i
+      "04"
+    when /may/i
+      "05"
+    when /jun/i
+      "06"
+    when /jul/i
+      "07"
+    when /aug/i
+      "08"
+    when /sep/i
+      "09"
+    when /oct/i
+      "10"
+    when /nov/i
+      "11"
+    when /dec/i
+      "12"
+    else
+      "00"
+  end
+  return num
+end
+
+class Version
+  attr_reader :parts
+  @parts = nil
+  def initialize(version)
+    @parts = case version
+      when /^\d+\.\d+.\d+$/ # extracted from document
+        match = version.match /^(?<part1>\d+)\.(?<part2>\d+)\.(?<part3>\d+)$/
+        [match[:part1].to_i, match[:part2].to_i, match[:part3].to_i]
+      when /^[0-9a-z]{3}$/i # extracted from file name
+        [version[0,1].to_i(36), version[1,1].to_i(36), version[2,1].to_i(36)]
+      when /^\d{6}$/ # extracted from file name
+        [version[0,2].to_i, version[2,2].to_i, version[4,2].to_i]
+      else
+        nil
+    end
+    raise "unknown version format: #{version}" unless @parts
+  end
+  def <=>(other)
+    if @parts[0]<other.parts[0] then
+      return -1
+    elsif @parts[0]>other.parts[0] then
+      return 1
+    elsif @parts[1]<other.parts[1] then
+      return -1
+    elsif @parts[1]>other.parts[1] then
+      return 1
+    elsif @parts[2]<other.parts[2] then
+      return -1
+    elsif @parts[2]>other.parts[2] then
+      return 1
+    else
+      return 0
+    end
+  end
+  def >(other)
+    return (self<=>other)>0
+  end
+  def <(other)
+    return (self<=>other)<0
+  end
+  def ==(other)
+    return (self<=>other)==0
+  end
+  def !=(other)
+    return (self<=>other)!=0
+  end
+  def to_s
+    return "#{@parts[0]}.#{@parts[1]}.#{@parts[2]}"
+  end
+end
+
+# use the document file name to get specification number and version when we could not extract if from the document itself or the extracted information does not match (the date remains unknown)
+# they quite often forget to update the version number in the documents, or do it wrong
+USE_FILENAME_VERSION = true
+# enforce the version number for the following files (useful when it can't be extracted or the extracted information is wrong)
+FILENAME_VERSION = {
+  "ftp.3gpp.org/Specs/archive/01_series/01.04/0104-502.txt" => {series: "01", mantissa: "04", version: Version.new("5.0.2"), date: "2001-10"},
+}
+
+desc "add version control on text specification"
+rule /#{SPECIFICATION_NUMBER_REGEXP}\.txt$/ => ["git", proc{|f| specifications.collect {|spec| f==spec[:txt] ? spec[:versions] : nil}.flatten.compact}] do |t|
+  puts "(re-)generating speficiation #{t.name} (including all versions)" if DEBUG
+  # get the spec
+  spec = specifications.select {|spec| t.name==spec[:txt]}
+  raise "specification for #{t.name} not found" if spec.empty?
+  spec = spec[0]
+  t.prerequisites.shift # remove git requirement
+  # verify is any of the dependency is newer
+  next if File.file?(t.name) and t.prerequisites.select{|txt| File.mtime(txt)>File.mtime(t.name)}.compact.empty?
+  # collect specification version information
+  versions = []
+  spec[:versions].each do |txt|
+    next unless File.size? txt
+    # get version number from file name
+    file = File.basename(txt)
+    match = file.match(/#{SPECIFICATION_VERSION_REGEXP}\.txt$/i)
+    if !match then
+      $stderr.puts "malformated specification version number: #{file}"
+      next
+    end
+    file_version = {series: match[:series], mantissa: match[:mantissa], other: match[:other], part: match[:part], subpart: match[:subpart], version: Version.new(match[:version])}
+    # get version number from document content
+    doc_version = FILENAME_VERSION[txt] # get enforced version
+    text = IO.read(txt) # get document content 
+    unless doc_version then # search for current aa.bbb Vc.d.e (yyyy-mm) format
+      text.each_line do |line|
+        if line =~ /^(GSM)|(UMTS)|(3G)|(3GPP)|(TS)/ then
+          match = line.match(/(?<series>\d{2})\.(?<mantissa>\d{2,3})(?<other>dcs|ext|E|U)?(-(?<part>\d{1,2})(-(?<subpart>\d{1,2}))?)?\s*V(?<version>\d+\.\d+.\d+)\s*\((?<date>\d{4}-\d{1,2})\)/i)
+          if match then
+            doc_version = {series: match[:series], mantissa: match[:mantissa], other: match[:other], part: match[:part], subpart: match[:subpart], version: Version.new(match[:version]), date: match[:date]}
+            break
+          end
+          match = line.match(/(?<month>\w+)\W+(?<year>\d{4})\s*\(.*(?<series>\d{2})\.(?<mantissa>\d{2,3})(?<other>dcs|ext|E|U)?(-(?<part>\d{1,2})(-(?<subpart>\d{1,2}))?)?\s*(V|version)\s*(?<version>\d+\.\d+.\d+)\s*\)/i)
+          if match then
+            doc_version = {series: match[:series], mantissa: match[:mantissa], other: match[:other], part: match[:part], subpart: match[:subpart], version: Version.new(match[:version]), date: match[:year]+"-"+month2num(match[:month])}
+            break
+          end
+          match = line.match(/(?<series>\d{2})\.(?<mantissa>\d{2,3})\W*(V|version)\W*(?<version>\d+\.\d+.\d+)\W*(?<month>\w+)\W+(?<year>\d{4})/i)
+          if match then
+            doc_version = {series: match[:series], mantissa: match[:mantissa], version: Version.new(match[:version]), date: match[:year]+"-"+month2num(match[:month])}
+            break
+          end
+        end
+      end
+    end
+    # get version from file name if yet unknown and desired
+    doc_version = file_version if !doc_version and USE_FILENAME_VERSION
+    # make version verifications
+    if !doc_version then
+      $stderr.puts "could not find specification number in #{txt}"
+      next
+    end
+    puts "#{txt} #{doc_version[:series]}.#{doc_version[:mantissa]} version: #{doc_version[:version]}#{doc_version[:date] ? ' ('+doc_version[:date].to_s+')' : ''}" if DEBUG
+    [:version, :series, :mantissa].each do |property|
+      if !doc_version[property] then
+        $stderr.puts "could not find #{property} in #{txt}"
+        next
+      end
+      if file_version[property] != doc_version[property] then
+        $stderr.puts "#{property} #{file_version[property]} from #{txt} file does not match #{property} #{doc_version[property]} in document"
+        if USE_FILENAME_VERSION then
+          doc_version[property] = file_version[property]
+        else
+          next
+        end
+      end
+    end
+    [:other, :part, :subpart].each do |property|
+      doc_version[property] ||= file_version[property]
+      if file_version[property] != doc_version[property] then
+        $stderr.puts "#{property} #{file_version[property]} from #{txt} file does not match #{property} #{doc_version[property]} in document"
+        if USE_FILENAME_VERSION then
+          doc_version[property] = file_version[property]
+        else
+          next
+        end
+      end
+    end
+    # save version information
+    doc_version[:file] = txt
+    versions << doc_version
+  end
+  # create empty file if no version is present
+  if versions.empty? then
+    sh "touch #{t.name}"
+    next
+  end
+  # sort specification versions based on version parts
+  versions.sort! {|a,b| a[:version]<=>b[:version]}
+  # check if we just need to update the specification, or regenerate it from scratch
+  regenerate = false
+  target_version = nil
+  if File.file?(t.name) then
+    if 0==File.size(t.name) then
+      regenerate = true
+    else
+      # sort between version older of newer than target specification
+      older = []
+      newer = []
+      versions.each do |version|
+        if File.mtime(version[:file]) > File.mtime(t.name) then
+          newer << version
+        else
+          older << version
+        end
+      end
+      # find which of the older specification corresponds the current target specification
+      older.reverse.each do |version|
+        if File.size(version[:file])==File.size(t.name) and IO.read(version[:file])==IO.read(t.name) then
+          target_version = version
+          break
+        end
+      end
+      if !target_version then # unknown current target specification version
+        regenerate = true
+      else
+        # ensure current target version has correct date
+        older.each do |version|
+          regenerate = true if version[:version] > target_version[:version]
+        end
+        newer.each do |version|
+          regenerate = true unless version[:version] > target_version[:version] 
+        end
+        if !regenerate then
+          versions = newer # only commit newer files
+        end
+      end
+    end
+  end
+  # restart specification regeneration if it's just an update
+  if regenerate then
+    # remove file commits from git
+    if system("git ls-files --error-unmatch #{t.name} &> /dev/null") then
+      sh "git rm --force #{t.name}"
+      sh "git commit --message='remove #{t.name} before regenerating specification'"
+      `git log --oneline -- #{t.name}`.each_line do |line|
+        hash = line.split(" ")[0]
+        sh "git rebase --preserve-merges --onto #{hash}^ #{hash}"
+      end
+    end
+  end
+  # put versions in versioning system
+  if versions.empty? then
+    puts "no new specification version found for #{t.name}" if DEBUG
+  end
+  versions.each_index do |i|
+    version = versions[i]
+    cp version[:file], t.name
+    # commit version
+    sh "git add #{t.name}"
+    spec_name = "#{version[:series]}.#{version[:mantissa]}"
+    spec_name += version[:other] if version[:other]
+    spec_name += "-"+version[:part] if version[:part]
+    spec_name += "-"+version[:subpart] if version[:subpart]
+    if 0==i then
+      if !target_version then
+        sh "git commit --message='initial #{spec_name} version #{version[:version]}#{version[:date] ? ' ('+version[:date]+')' : ''}'"
+      else
+        sh "git commit --allow-empty --message='#{spec_name} version #{target_version[:version]}#{target_version[:date] ? ' ('+target_version[:date]+')' : ''} -> #{version[:version]}#{version[:date] ? ' ('+version[:date]+')' : ''}'"
+      end
+    else
+      sh "git commit --allow-empty --message='#{spec_name} version #{versions[i-1][:version]}#{versions[i-1][:date] ? ' ('+versions[i-1][:date]+')' : ''} -> #{version[:version]}#{version[:date] ? ' ('+version[:date]+')' : ''}'"
+    end
+    sh "git tag '#{spec_name}v#{version[:version]}'"
+  end
+end
+
+desc "convert all .xhtml speficification documents into .txt text"
+task :text => specifications.collect {|spec| spec[:versions].collect{|version| version}}.flatten
+
+desc "convert .xhtml document to .txt text"
+rule '.txt' => '.xhtml' do |t|
+  puts "converting #{t.prerequisites[0]} to #{t.name}" if DEBUG
+  File.open(t.name, "w") do |file|
+    next unless File.size? t.prerequisites[0]
+    # open XHTML
+    doc = Nokogiri::XML(File.open(t.prerequisites[0]))
+    doc.remove_namespaces!
+
+    # remove title since it's often wrong
+    doc.xpath("//head/title").each do |title|
+      title.remove
+    end
+    # remove page number from table of content
+    doc.xpath("//p[contains(@class,'tOC_')]").each do |toc|
+      toc.traverse do |node|
+        if node.text? then
+          node.content = node.content.gsub(/\s+(\d+)?$/,'')
+          if node.content.match(/^\d+[[:alpha:]]/) then
+            node.content = node.content.gsub(/^\d+/,'')
+          end
+        end
+      end
+    end
+    # remove images
+    doc.xpath("//img").each do |img|
+      if img["src"] and img["src"].end_with?(".wmf") then
+        img.parent.remove
+      else
+        img.remove
+      end
+    end
+    # remove embedded diagrams
+    doc.xpath("//div[contains(@class,'embedded')]").each do |div|
+      div.remove
+    end
+    doc.xpath("//div[contains(@class,'package-entry')]").each do |div|
+      div.remove
+    end
+
+    # convert to text
+    text = doc.text
+    # remove heading spaces
+    text.gsub!(/^[[:blank:]]+/,"")
+    # remove tailing spaces
+    text.gsub!(/[[:blank:]]+$/,"")
+    # remove multiple newlines
+    text.gsub!(/(\n){2,}/,"\n\n")
+    # remove first empty line
+    text = text[1..-1] while text[0]=="\n"
+    # fix bullet points
+    text.gsub!(/^-\n/,"- ")
+    text.gsub!(/\n\n- /,"\n- ")
+
+    file.write text
+  end
+end
+
+desc "convert all .doc speficification documents into .xhtml documents"
+task :convert => specifications.collect {|spec| spec[:versions].collect{|version| version.ext("xhtml")}}.flatten
+
+# doc files not to convert because they are not supported or broken
+DOC_NOCONVERT = [
+"ftp.3gpp.org/Specs/archive/02_series/02.22/0222-110.doc",
+"ftp.3gpp.org/Specs/archive/02_series/02.95/0295-010.doc",
+"ftp.3gpp.org/Specs/archive/22_series/22.016/22016-a00.doc",
+"ftp.3gpp.org/Specs/archive/24_series/24.008/24008-530.doc",
+"ftp.3gpp.org/Specs/archive/25_series/25.321/25321-200.doc",
+"ftp.3gpp.org/Specs/archive/31_series/31.122/31122-100.doc",
+]
+
+desc "convert .doc specification document to .xhtml document"
+rule '.xhtml' => ["tika-app.jar", '.doc'] do |t|
+  puts "converting #{t.prerequisites[1]} to #{t.name}" if DEBUG
+  xhtml = File.open(t.name, "w") # open empty document
+  unless 0==File.size(t.prerequisites[1]) or DOC_NOCONVERT.include?(t.prerequisites[1]) then # doc is not empty and can be converted
+    stdout, stderr, status = Open3.capture3("java" ,"-jar", t.prerequisites[0], "--pretty-print", "--xml", t.prerequisites[1])
+    if 0==status.exitstatus then
+      xhtml.write stdout
+    elsif stderr.include? "The supplied data appears to be in the old MS Write format" then
+      puts "can't convert #{t.prerequisites[1]} to XHTML: old MS Write format is not supported"
+    else
+      puts "conversion from #{t.prerequisites[1]} to #{t.name} failed"
+    end
+  end
+  xhtml.close
+end
+
+desc "extract all .doc speficification documents from .zip archives"
+task :extract => specifications.collect {|spec| spec[:versions].collect{|version| version.ext("doc")}}.flatten
+
+# the actual file in the archive matching to the expected file
+DOC_FILENAME = {
+"48103-132.doc" => "GP-081959 New AUP TS 48.103 v132.doc",
+"48103-130.doc" => "GP-081880 New AUP TS 48.103 v130.doc",
+"48103-100.doc" => "GP-081422 New AUP TS v003.doc",
+"48103-131.doc" => "GP-081937 New AUP TS 48.103 v131.doc",
+"28601-010.doc" => "28601-010 CN and WLAN Interworking system NRM IRP Requirements_clean.doc",
+"28900-010.doc" => "S5-176535_28.9bc-010.doc",
+"29846-030 .doc" => "29846-030 .doc",
+"21915-000.doc" => "21915-001.doc",
+"0276-801.doc" => "0276_800.doc",
+"45820-210.doc" => "TR 45 820v210_approved.doc",
+"45820-200.doc" => "TR 45 820v200_clean.doc",
+"45820-121.doc" => "TR 45 820 v121_clean.doc",
+"45820-100.doc" => "TR 45 820 v100 clean.doc",
+"45820-140.doc" => "TR 45 820v140_clean.doc",
+"28800-200.doc" => "28800-100.doc",
+"44318-010.doc" => "TS44_318_v_0_1_0.doc",
+"44933-050.doc" => "TR Seamless Support of Streaming v050.doc",
+"44933-060.doc" => "TR Seamless Support of Streaming v060 1.doc",
+"45926-010.doc" => "GP-111399 BTS Energy Savings v010_clean.doc",
+"29228-d30.doc" => "29128-d30.doc",
+"29280-100.doc" => "29xyz-100.doc",
+"29234-150.doc" => "29.234_V1.5_clean.doc",
+"29234-170.doc" => "29.234_V1.7CLEAN.doc",
+"29279-100.doc" => "29.xyz-100.doc",
+"29139-100.doc" => "29139-020.doc",
+"29281-100.doc" => "29xyz-100.doc",
+"29198-13-001.doc" => "120091_13_v001.doc",
+"33401-100.doc" => "33abc-100.doc",
+"33833-040.doc" => "33803-040.doc",
+"26347-031.doc" => "TS26 347v031-clean.doc",
+"26347-021.doc" => "TS26 347v021.doc",
+"26347-020.doc" => "TS26 347v020.doc",
+"26347-010.doc" => "TS26 347v010.doc",
+"32584-100.doc" => "32584-020_clean.doc",
+"34114-100.doc" => "TS34 114_100.doc",
+"25927-100.doc" => "TR25.927.doc",
+"25809-100.doc" => "TR25_809_v100.doc",
+"25809-200.doc" => "TR25_809_v200.doc",
+"25809-052.doc" => "TR25_809_v052.doc",
+"25822-100.doc" => "UMTS700_TR-25_822_100.doc",
+"25990-014.doc" => "25990-004.doc",
+"23722-001.doc" => "23.722-d000.doc",
+"23781-011.doc" => "TR_23.781_011_cl.docx",
+"23781-020.doc" => "23.781_020_cl.docx",
+"23810-0a0.doc" => "23810-0100-clean.doc",
+"23858-010.doc" => "TR23.856v0.1.0_cl.doc",
+"23858-020.doc" => "TR23.856v0.2.0_cl.doc",
+"23882-0a1.doc" => "23882-0100-clean.doc",
+"23917-0a0.doc" => "TR 23.917 v0100 clean.doc",
+"36839-011.doc" => "TR36 839v011.doc",
+"36839-021.doc" => "TR36 839v021.doc",
+"36853-100.doc" => "RP-140857_TR36 853_V100.doc",
+"36853-200.doc" => "RP-141217_TR36 853_V200.doc",
+"36853-220.doc" => "RP-141806_TR36 853_V220.doc",
+"36856-100.doc" => "RP-140856_TR36 856_V100.doc",
+"36889-021.doc" => "TR 36 889 v0 2 1.doc",
+"36889-030.doc" => "TR 36 889 v0 3 0.doc",
+"36942-200.doc" => "RP-080592_TR36_942_v200.doc",
+"38141-1-001.doc" => "R4-1711982 TS 38.141-1 v0.0.1.docx",
+"38141-1-010.doc" => "R4-1803913 TS 38.141-1 v0.1.0(clean).docx",
+"38141-2-001.doc" => "R4-1711983 TS 38.141-2 v0.0.1.docx",
+"38331-040.doc" => "TS38331-040 cl.docx",
+"38816-001.doc" => "TR 38.816 V010_clean.doc",
+}
+
+desc "extract .doc specification document from .zip archive"
+rule '.doc' => proc{|f| File.file?(f.ext("zip")) ? f.ext("zip") : f.ext("ZIP")} do |t|
+  puts "extracting #{t.name} from #{t.prerequisites[0]}" if DEBUG
+  # parse spec number
+  doc = File.basename(t.name)
+  number = doc.match(/^(?<series>\d{2})\.?(?<mantissa>\d{2,3})(?<other>dcs|ext|E|U)?(-(?<part>\d{1,2})(-(?<subpart>\d{1,2}))?)?( )?[-_](?<version>[0-9a-z]{3,6})( )?\.doc$/i)
+  if number then
+    # open archive
+    zip = Zip::File.open(t.prerequisites[0])
+    # find doc file in archive
+    zip_file = zip.entries.select {|file| file.name =~ /#{number[:series]}\.?#{number[:mantissa]}(#{number[:other]})?[-_A-Z]?#{number[:version]}([-_]cl(ean)?)?\.doc(x)?$/i}
+    zip_file = zip.entries.select {|file| file.name =~ /#{number[:series]}\.?#{number[:mantissa]}.*#{number[:version][0]}.*#{number[:version][1]}.*#{number[:version][2]}.*\.doc$/i} if zip_file.empty?
+    zip_file = zip.entries.select {|file| file.name==DOC_FILENAME[doc]} if zip_file.empty?
+    if zip_file.empty? then # doc file not found in archive
+      $stderr.puts "#{t.prerequisites[0]} does not include #{doc}: #{zip.entries.collect{|f| f.name}.to_s}"
+      File.open(t.name, "w") # create empty file
+    else # extract doc file
+      zip_file.first.extract(t.name)
+    end
+  else
+    puts "could not find number for #{doc}"
+  end
+end
+
+desc "remove bogus specifications (e.g. malformated files)"
+task :clean_bogus do
+  specifications.each do |spec|
+    if File.file?(spec[:txt]) and 0==File.size(spec[:txt]) then
+      puts "removing bogus #{spec[:txt]}"
+      File.delete(file)
+    end
+    spec[:versions].each do |version|
+      [version, version.ext("doc")].each do |file|
+        if File.file?(file) and 0==File.size(file) then
+          puts "removing bogus #{file}"
+          File.delete(file)
+        end
+      end
+    end
+  end
+end
+
+# return the total count and size of zip archives in the directory
+def zip_size(dir)
+  count = 0
+  size = 0
+  return [count,size] unless File.directory? dir
+  Dir.foreach(dir) do |file|
+    next if "."==file or ".."==file
+    path = "#{dir}/#{file}"
+    if File.file? path then
+      if file.downcase.end_with?(".zip") then
+        count += 1
+        size += File.size(path)
+      end
+    elsif File.directory? path then
+      rc = zip_size(path)
+      count += rc[0]
+      size += rc[1]
+    end
+  end
+  return [count,size]
+end
+
+desc "counts the number of files and total size"
+task :stats do
+  count, size = zip_size(SPEC_DIR)
+  puts "number of .zip 3GPP archives: #{count}"
+  puts "total .zip 3GPP archives size: #{((size.to_f/1000/1000).to_i.to_f)/1000} GB"
+
+  puts "number of specifications: #{specifications.size}"
+
+  count = 0
+  specifications.each {|spec| count += spec[:versions].size}
+  puts "number of .zip specification archives: #{count}"
+  size = 0
+  specifications.each do |spec|
+    spec[:versions].each do |version|
+      zip = (File.file?(version.ext("zip")) ? version.ext("zip") : version.ext("ZIP"))
+      size += File.size(zip)
+    end
+  end
+  puts "total .zip specification archives size: #{((size.to_f/1000/1000).to_i.to_f)/1000} GB"
+
+  [".doc", ".xhtml", ".txt"].each do |extension|
+    count = 0
+    bogus = 0
+    size = 0
+    specifications.each do |spec|
+      spec[:versions].each do |version|
+        next unless File.file?(version.ext(extension))
+        (0==File.size(version.ext(extension))) ? (bogus += 1) : (count += 1)
+        size += File.size(version.ext(extension))
+      end
+    end
+    puts "number of #{extension} specification documents: #{count} (+ #{bogus} bogus)"
+    puts "total #{extension} specification documents size: #{((size.to_f/1000/1000).to_i.to_f)/1000} GB"
+  end
+end
+
+CLEAN.include(specifications.collect {|spec| spec[:versions].collect{|version| version.ext("txt")}}.flatten) # .txt files
+CLEAN.include(specifications.collect {|spec| spec[:versions].collect{|version| version.ext("xhtml")}}.flatten) # .xhtml files
+CLEAN.include(specifications.collect {|spec| spec[:versions].collect{|version| version.ext("doc")}}.flatten) # .doc files
+CLOBBER.include(specifications.collect {|spec| spec[:txt]}) # text specifications
+CLOBBER.include(".gitignore")
+CLOBBER.include(".git")

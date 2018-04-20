@@ -1,0 +1,10 @@
+3GPP Global Revision Repositories (3GPP) aims to put version control on 3GPP specifications.
+
+Each sub-project provides tools for a specific aspect.
+
+3gpp-spec
+---------
+
+Downloads 3GPP specifications and extracts the text content from the .doc documents into .txt files.
+These text files are then put into a git repository, on commit per specification version.
+
